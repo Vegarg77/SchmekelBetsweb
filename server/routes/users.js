@@ -35,23 +35,26 @@ router.get('/:id', async (req, res) => {
 // POST /api/users/daily-bonus - claim daily Schmekel bonus
 router.post('/daily-bonus', requireAuth, async (req, res) => {
   const userId = req.user.id
-  const today  = new Date().toISOString().split('T')[0]
+  const BONUS  = 10
 
   try {
-    const { rows } = await db.query('SELECT daily_claimed FROM users WHERE id = $1', [userId])
-    if (rows[0].daily_claimed && rows[0].daily_claimed.toISOString().startsWith(today)) {
-      return res.status(400).json({ error: 'Already claimed today', nextClaim: tomorrow() })
-    }
-
-    const BONUS = 10
+    // Atomic conditional update: only succeeds when daily_claimed is before
+    // today (or NULL). Concurrent duplicate requests both hit this UPDATE but
+    // only the first one will match the WHERE clause and return a row — the
+    // second will get 0 rows back and be rejected, eliminating the TOCTOU race.
     const result = await db.query(
       `UPDATE users
-       SET schmekels    = schmekels + $1,
+       SET schmekels     = schmekels + $1,
            daily_claimed = CURRENT_DATE
        WHERE id = $2
+         AND (daily_claimed IS NULL OR daily_claimed < CURRENT_DATE)
        RETURNING schmekels`,
       [BONUS, userId]
     )
+
+    if (result.rows.length === 0) {
+      return res.status(400).json({ error: 'Already claimed today', nextClaim: tomorrow() })
+    }
 
     await db.query(
       `INSERT INTO transactions (user_id, type, amount, balance_after, note)

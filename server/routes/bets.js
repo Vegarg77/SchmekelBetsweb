@@ -2,6 +2,15 @@ const router = require('express').Router()
 const db     = require('../config/database')
 const { requireAuth } = require('../middleware/auth')
 
+// Validation errors thrown inside transactions are caught by the shared catch
+// block, which rolls back before responding — no leaked transactions.
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message)
+    this.status = status
+  }
+}
+
 // ─── List / Search ───────────────────────────────────────────────────────────
 
 // GET /api/bets?status=open&category=1&page=1&limit=20&q=search
@@ -37,30 +46,46 @@ router.get('/', async (req, res) => {
 
   try {
     params.push(parseInt(limit), offset)
+    // Aggregate placements and outcomes in separate subqueries to avoid the
+    // cartesian product that arises when both are joined in the same GROUP BY
+    // (placements × outcomes rows per bet inflates SUM and JSON_AGG).
     const { rows } = await db.query(
       `SELECT b.id, b.title, b.description, b.status, b.closes_at, b.created_at,
               b.min_wager, b.max_wager, b.is_private,
               c.name AS category_name, c.emoji AS category_emoji,
               u.username AS creator_name, u.avatar_url AS creator_avatar, u.id AS creator_id,
-              COALESCE(SUM(bp.amount), 0) AS total_pool,
-              COUNT(DISTINCT bp.id) AS placement_count,
-              COUNT(DISTINCT bp.user_id) AS unique_bettors,
-              JSON_AGG(
-                JSON_BUILD_OBJECT('id', bo.id, 'label', bo.label, 'color', bo.color,
-                  'total', COALESCE(ot.outcome_total, 0))
-                ORDER BY bo.id
-              ) AS outcomes
+              COALESCE(ps.total_pool, 0)       AS total_pool,
+              COALESCE(ps.placement_count, 0)  AS placement_count,
+              COALESCE(ps.unique_bettors, 0)   AS unique_bettors,
+              COALESCE(os.outcomes, '[]'::json) AS outcomes
        FROM bets b
        LEFT JOIN categories c ON c.id = b.category_id
        LEFT JOIN users u ON u.id = b.creator_id
-       LEFT JOIN bet_placements bp ON bp.bet_id = b.id
-       LEFT JOIN bet_outcomes bo ON bo.bet_id = b.id
+       -- placement totals per bet (no outcomes in scope here)
        LEFT JOIN (
-         SELECT outcome_id, SUM(amount) AS outcome_total
-         FROM bet_placements GROUP BY outcome_id
-       ) ot ON ot.outcome_id = bo.id
+         SELECT bet_id,
+                SUM(amount)              AS total_pool,
+                COUNT(*)                 AS placement_count,
+                COUNT(DISTINCT user_id)  AS unique_bettors
+         FROM bet_placements
+         GROUP BY bet_id
+       ) ps ON ps.bet_id = b.id
+       -- outcome list with per-outcome totals (no placements cross-join here)
+       LEFT JOIN (
+         SELECT bo.bet_id,
+                JSON_AGG(
+                  JSON_BUILD_OBJECT('id', bo.id, 'label', bo.label, 'color', bo.color,
+                    'total', COALESCE(ot.outcome_total, 0))
+                  ORDER BY bo.id
+                ) AS outcomes
+         FROM bet_outcomes bo
+         LEFT JOIN (
+           SELECT outcome_id, SUM(amount) AS outcome_total
+           FROM bet_placements GROUP BY outcome_id
+         ) ot ON ot.outcome_id = bo.id
+         GROUP BY bo.bet_id
+       ) os ON os.bet_id = b.id
        ${where}
-       GROUP BY b.id, c.name, c.emoji, u.username, u.avatar_url, u.id
        ORDER BY ${order}
        LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params
@@ -234,31 +259,31 @@ router.post('/:id/place', requireAuth, async (req, res) => {
       'SELECT * FROM bets WHERE id = $1 FOR UPDATE',
       [betId]
     )
-    if (!bet) return res.status(404).json({ error: 'Bet not found' })
-    if (bet.status !== 'open') return res.status(400).json({ error: 'Bet is not open' })
+    if (!bet) throw new HttpError(404, 'Bet not found')
+    if (bet.status !== 'open') throw new HttpError(400, 'Bet is not open')
     if (bet.closes_at && new Date(bet.closes_at) < new Date())
-      return res.status(400).json({ error: 'Bet has closed' })
+      throw new HttpError(400, 'Bet has closed')
     if (bet.creator_id === userId)
-      return res.status(400).json({ error: "You can't bet on your own bet" })
+      throw new HttpError(400, "You can't bet on your own bet")
 
     // Check outcome belongs to this bet
     const { rows: [outcome] } = await client.query(
       'SELECT * FROM bet_outcomes WHERE id = $1 AND bet_id = $2',
       [outcome_id, betId]
     )
-    if (!outcome) return res.status(400).json({ error: 'Invalid outcome' })
+    if (!outcome) throw new HttpError(400, 'Invalid outcome')
 
     // Check for existing placement
     const { rows: existing } = await client.query(
       'SELECT id FROM bet_placements WHERE user_id = $1 AND bet_id = $2',
       [userId, betId]
     )
-    if (existing.length > 0) return res.status(400).json({ error: 'Already placed a bet on this' })
+    if (existing.length > 0) throw new HttpError(400, 'Already placed a bet on this')
 
     if (bet.min_wager && amount < bet.min_wager)
-      return res.status(400).json({ error: `Minimum wager is ${bet.min_wager} Schmekels` })
+      throw new HttpError(400, `Minimum wager is ${bet.min_wager} Schmekels`)
     if (bet.max_wager && amount > bet.max_wager)
-      return res.status(400).json({ error: `Maximum wager is ${bet.max_wager} Schmekels` })
+      throw new HttpError(400, `Maximum wager is ${bet.max_wager} Schmekels`)
 
     // Lock and deduct from user balance
     const { rows: [user] } = await client.query(
@@ -266,7 +291,7 @@ router.post('/:id/place', requireAuth, async (req, res) => {
       [userId]
     )
     if (user.schmekels < amount)
-      return res.status(400).json({ error: 'Insufficient Schmekels' })
+      throw new HttpError(400, 'Insufficient Schmekels')
 
     const newBalance = user.schmekels - amount
     await client.query(
@@ -295,6 +320,7 @@ router.post('/:id/place', requireAuth, async (req, res) => {
     res.json({ placement, newBalance })
   } catch (err) {
     await client.query('ROLLBACK')
+    if (err instanceof HttpError) return res.status(err.status).json({ error: err.message })
     console.error(err)
     res.status(500).json({ error: 'Failed to place bet' })
   } finally {
@@ -318,19 +344,19 @@ router.post('/:id/resolve', requireAuth, async (req, res) => {
       'SELECT * FROM bets WHERE id = $1 FOR UPDATE',
       [betId]
     )
-    if (!bet) return res.status(404).json({ error: 'Bet not found' })
+    if (!bet) throw new HttpError(404, 'Bet not found')
     if (bet.creator_id !== userId)
-      return res.status(403).json({ error: 'Only the creator can resolve' })
+      throw new HttpError(403, 'Only the creator can resolve')
     if (bet.status === 'resolved')
-      return res.status(400).json({ error: 'Already resolved' })
+      throw new HttpError(400, 'Already resolved')
     if (!['open', 'closed'].includes(bet.status))
-      return res.status(400).json({ error: 'Cannot resolve this bet' })
+      throw new HttpError(400, 'Cannot resolve this bet')
 
     const { rows: [outcome] } = await client.query(
       'SELECT * FROM bet_outcomes WHERE id = $1 AND bet_id = $2',
       [winning_outcome_id, betId]
     )
-    if (!outcome) return res.status(400).json({ error: 'Invalid outcome' })
+    if (!outcome) throw new HttpError(400, 'Invalid outcome')
 
     // Get all placements
     const { rows: allPlacements } = await client.query(
@@ -394,6 +420,7 @@ router.post('/:id/resolve', requireAuth, async (req, res) => {
     res.json({ ok: true, totalPool, winners: winners.length })
   } catch (err) {
     await client.query('ROLLBACK')
+    if (err instanceof HttpError) return res.status(err.status).json({ error: err.message })
     console.error(err)
     res.status(500).json({ error: 'Failed to resolve bet' })
   } finally {
@@ -415,11 +442,11 @@ router.post('/:id/cancel', requireAuth, async (req, res) => {
     const { rows: [bet] } = await client.query(
       'SELECT * FROM bets WHERE id = $1 FOR UPDATE', [betId]
     )
-    if (!bet) return res.status(404).json({ error: 'Bet not found' })
+    if (!bet) throw new HttpError(404, 'Bet not found')
     if (bet.creator_id !== userId)
-      return res.status(403).json({ error: 'Only the creator can cancel' })
+      throw new HttpError(403, 'Only the creator can cancel')
     if (!['open', 'closed'].includes(bet.status))
-      return res.status(400).json({ error: 'Cannot cancel this bet' })
+      throw new HttpError(400, 'Cannot cancel this bet')
 
     // Refund all bettors
     const { rows: placements } = await client.query(
@@ -444,6 +471,7 @@ router.post('/:id/cancel', requireAuth, async (req, res) => {
     res.json({ ok: true })
   } catch (err) {
     await client.query('ROLLBACK')
+    if (err instanceof HttpError) return res.status(err.status).json({ error: err.message })
     console.error(err)
     res.status(500).json({ error: 'Failed to cancel bet' })
   } finally {
