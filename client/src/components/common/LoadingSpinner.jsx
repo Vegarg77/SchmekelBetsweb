@@ -1,0 +1,9 @@
+export default function LoadingSpinner({ size = 'md', text }) {
+  const sizes = { sm: 'w-4 h-4', md: 'w-8 h-8', lg: 'w-12 h-12' }
+  return (
+    <div className="flex flex-col items-center justify-center gap-3 py-8">
+      <div className={`${sizes[size]} border-2 border-dark-600 border-t-schmekel-500 rounded-full animate-spin`} />
+      {text && <p className="text-dark-400 text-sm">{text}</p>}
+    </div>
+  )
+}
